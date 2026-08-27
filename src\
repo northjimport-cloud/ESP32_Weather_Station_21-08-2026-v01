@@ -1,0 +1,222 @@
+/*
+ * ESP32 Weather Station
+ * Copyright (c) 2026 [اسمك]
+ * 
+ * Licensed under the MIT License.
+ * See LICENSE file for details.
+ * 
+ * Created by: [اNorthjim]
+ * Date: 21-08-2026
+ */
+import network
+import socket
+import ure
+import json
+import time
+import machine
+import dht
+import ssd1306
+
+# ========== إعدادات الأجهزة ==========
+# OLED (I2C)
+i2c = machine.I2C(scl=machine.Pin(22), sda=machine.Pin(21))
+oled = ssd1306.SSD1306_I2C(128, 64, i2c)
+
+# DHT22 على GPIO4
+dht_sensor = dht.DHT22(machine.Pin(4))
+
+# LED مدمج للمؤشر
+led = machine.Pin(2, machine.Pin.OUT)
+
+# ThingSpeak ← ضع بياناتك هنا
+THINGSPEAK_API_KEY = "XXXXXXXXXXXXXXXX"  # ← Write API Key
+THINGSPEAK_CHANNEL = 123456               # ← رقم القناة
+
+# ========== دوال WiFi ==========
+def load_wifi_config():
+    try:
+        with open('wifi_config.json', 'r') as f:
+            return json.load(f)
+    except:
+        return None
+
+def save_wifi_config(ssid, password):
+    with open('wifi_config.json', 'w') as f:
+        json.dump({"ssid": ssid, "password": password}, f)
+
+def connect_wifi(ssid, password):
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(True)
+    if wlan.isconnected():
+        return True
+    wlan.connect(ssid, password)
+    for i in range(20):  # انتظر 10 ثوانٍ
+        if wlan.isconnected():
+            return True
+        led.value(i % 2)  # وميض LED أثناء الاتصال
+        time.sleep(0.5)
+    return False
+
+# ========== Captive Portal (تهيئة WiFi) ==========
+def start_captive_portal():
+    ap = network.WLAN(network.AP_IF)
+    ap.active(True)
+    ap.config(essid='ESP32_Config', password='12345678', authmode=network.AUTH_WPA_WPA2_PSK)
+    
+    addr = socket.getaddrinfo('0.0.0.0', 80)[0][-1]
+    s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(addr)
+    s.listen(1)
+    
+    print('AP Started: ESP32_Config / 12345678')
+    
+    # عرض على OLED
+    oled.fill(0)
+    oled.text("WiFi Setup Mode", 0, 0)
+    oled.text("1. Connect to:", 0, 16)
+    oled.text("ESP32_Config", 0, 28)
+    oled.text("2. Open browser", 0, 40)
+    oled.text("3. Enter WiFi", 0, 52)
+    oled.show()
+    
+    while True:
+        cl, addr = s.accept()
+        try:
+            request = cl.recv(1024).decode('utf-8')
+            
+            # استخراج SSID وPassword من الرابط
+            match = ure.search(r'GET /\?ssid=([^&]*)&pass=([^ ]*)', request)
+            if match:
+                ssid = match.group(1).replace('%20', ' ').replace('+', ' ')
+                password = match.group(2).replace('%20', ' ').replace('+', ' ')
+                save_wifi_config(ssid, password)
+                
+                response = """HTTP/1.0 200 OK\r\nContent-Type: text/html\r\n\r\n
+                <!DOCTYPE html><html dir="rtl">
+                <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width">
+                <style>body{font-family:Arial;text-align:center;padding:40px;background:#1a1a2e;color:#fff}
+                .box{background:#16213e;padding:30px;border-radius:15px;max-width:300px;margin:auto}
+                h2{color:#4ecca3}</style></head>
+                <body><div class="box"><h2>✅ تم الحفظ!</h2>
+                <p>ESP32 سيعيد التشغيل الآن...</p></div></body></html>"""
+                cl.send(response)
+                cl.close()
+                time.sleep(2)
+                machine.reset()  # إعادة تشغيل للاتصال بالشبكة الجديدة
+            
+            # صفحة الإعدادات
+            html = """HTTP/1.0 200 OK\r\nContent-Type: text/html\r\n\r\n
+            <!DOCTYPE html><html dir="rtl">
+            <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width">
+            <style>body{font-family:Arial;text-align:center;padding:20px;background:#0f3460;color:#fff}
+            .box{background:#16213e;padding:25px;border-radius:15px;max-width:320px;margin:auto;box-shadow:0 0 20px rgba(0,0,0,0.3)}
+            h2{color:#e94560;margin-bottom:20px}input{width:100%;padding:12px;margin:8px 0;
+            border:none;border-radius:8px;box-sizing:border-box;font-size:16px}
+            button{background:#e94560;color:#fff;padding:12px 30px;border:none;border-radius:8px;
+            font-size:18px;cursor:pointer;width:100%;margin-top:10px}
+            button:hover{background:#ff6b6b}</style></head>
+            <body><div class="box"><h2>🔧 إعدادات WiFi</h2>
+            <form><input name="ssid" placeholder="اسم الشبكة (SSID)" required>
+            <input name="pass" type="password" placeholder="كلمة المرور" required>
+            <button type="submit">اتصال وحفظ</button></form></div></body></html>"""
+            
+            cl.send(html)
+        except Exception as e:
+            print("Error:", e)
+        finally:
+            cl.close()
+
+# ========== إرسال البيانات ==========
+def send_to_thingspeak(temp, hum):
+    try:
+        import urequests
+        url = "http://api.thingspeak.com/update?api_key={}&field1={}&field2={}".format(
+            THINGSPEAK_API_KEY, temp, hum)
+        response = urequests.get(url)
+        status = response.status_code
+        response.close()
+        return status == 200
+    except Exception as e:
+        print("Send error:", e)
+        return False
+
+# ========== عرض البيانات ==========
+def display_data(temp, hum, status):
+    oled.fill(0)
+    oled.text("ESP32 + DHT22", 0, 0)
+    oled.text("Temp: {:.1f} C".format(temp), 0, 18)
+    oled.text("Hum : {:.1f} %".format(hum), 0, 30)
+    
+    if status:
+        oled.text("Cloud: Sent", 0, 48)
+    else:
+        oled.text("Cloud: Failed", 0, 48)
+    
+    oled.show()
+
+# ========== البرنامج الرئيسي ==========
+def main():
+    # محاولة الاتصال بالشبكة المحفوظة
+    config = load_wifi_config()
+    if config:
+        oled.fill(0)
+        oled.text("Connecting to:", 0, 0)
+        oled.text(config['ssid'][:16], 0, 16)
+        oled.show()
+        
+        if not connect_wifi(config['ssid'], config['password']):
+            start_captive_portal()  # فشل الاتصال → افتح AP
+    else:
+        start_captive_portal()  # لا يوجد إعدادات → افتح AP
+    
+    # ✅ متصل! ابدأ إرسال البيانات
+    wlan = network.WLAN(network.STA_IF)
+    ip = wlan.ifconfig()[0]
+    
+    oled.fill(0)
+    oled.text("WiFi Connected!", 0, 0)
+    oled.text(ip, 0, 16)
+    oled.text("Starting...", 0, 32)
+    oled.show()
+    time.sleep(2)
+    
+    # تأكد من تثبيت urequests
+    try:
+        import urequests
+    except ImportError:
+        oled.fill(0)
+        oled.text("Installing...", 0, 0)
+        oled.text("urequests...", 0, 16)
+        oled.show()
+        import mip
+        mip.install("urequests")
+        machine.reset()
+    
+    # الحلقة الرئيسية
+    while True:
+        try:
+            dht_sensor.measure()
+            temp = dht_sensor.temperature()
+            hum = dht_sensor.humidity()
+            
+            print("Temp: {}C, Hum: {}%".format(temp, hum))
+            
+            # إرسال + عرض
+            success = send_to_thingspeak(temp, hum)
+            display_data(temp, hum, success)
+            
+            led.value(1)
+            time.sleep(0.1)
+            led.value(0)
+            
+            time.sleep(20)  # ThingSpeak يسمح بـ 15 ثانية كحد أدنى
+            
+        except Exception as e:
+            print("Loop error:", e)
+            oled.fill(0)
+            oled.text("Sensor Error!", 0, 0)
+            oled.show()
+            time.sleep(5)
+
+main()
